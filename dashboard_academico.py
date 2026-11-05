@@ -21,12 +21,21 @@ Lógica de cumplimiento (según la Lista de seguimiento):
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import http.cookiejar
+import os
 import re
+import time
 import unicodedata
+import urllib.error
+import urllib.request
 import warnings
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import numpy as np
 import pandas as pd
@@ -56,7 +65,17 @@ st.set_page_config(page_title="Seguimiento Académico UCC", page_icon="🎓",
 # ----------------------------------------------------------------------------
 # Configuración
 # ----------------------------------------------------------------------------
-ARCHIVO_POR_DEFECTO = "seguimiento_academico.xlsx"   # se usa si no se sube nada
+# Fuente principal: enlace de SharePoint "Cualquier persona con el vínculo · Puede ver". El dashboard lo
+# descarga solo y lo refresca cada 5 minutos, sin subir nada. Se puede reemplazar sin tocar el código con
+# st.secrets["excel_url"] (.streamlit/secrets.toml) o con la variable de entorno DASHBOARD_EXCEL_URL.
+ENLACE_SHAREPOINT = ("https://ucceduco-my.sharepoint.com/:x:/g/personal/campusvirtual_bog_ucc_edu_co/"
+                     "cQrozCZpgt3iQapzRaNVLDQxEgUD5wlwErZwMWQoHCfZffDhqg")
+MINUTOS_CACHE = 5
+# Respaldo: archivo en la carpeta de SharePoint/OneDrive SINCRONIZADA en este computador (se lee solo, sin subirlo).
+# Se puede cambiar sin editar el código con la variable de entorno DASHBOARD_EXCEL_RUTA.
+RUTA_EXCEL = (r"C:\Users\elearning.bog\Universidad Cooperativa de Colombia"
+              r"\E-learning Bogotá - Lista de seguimiento\Lista de seguimiento VF.xlsm")
+ARCHIVO_POR_DEFECTO = "seguimiento_academico.xlsx"   # respaldo local junto al script (opcional)
 TODOS = "Todos los programas"
 NOMBRES_MOD = {"Extendida": "Aulas extendidas (presenciales)", "Virtual": "Aulas virtuales"}
 COLORES_ESTADO = {"Si": "#16a34a", "Incompleto": "#f59e0b", "No": "#dc2626"}
@@ -171,6 +190,84 @@ def leer_hoja(xls: pd.ExcelFile, nombre: str):
     df = xls.parse(nombre, header=h)
     df.columns = [str(c).strip() for c in df.columns]
     return df
+
+
+def obtener_enlace() -> str:
+    try:
+        v = st.secrets.get("excel_url")      # secrets.toml puede no existir
+    except Exception:
+        v = None
+    return v or os.environ.get("DASHBOARD_EXCEL_URL") or ENLACE_SHAREPOINT
+
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/124.0 Safari/537.36")
+
+
+def url_descarga(url: str) -> str:
+    """Un enlace público de SharePoint entrega el archivo directo al añadir download=1."""
+    u = urlparse(url.strip())
+    q = dict(parse_qsl(u.query))
+    q["download"] = "1"
+    return urlunparse(u._replace(query=urlencode(q)))
+
+
+def candidatos_descarga(url: str):
+    """Distintas formas de pedirle a SharePoint el archivo de un enlace 'Cualquier persona'."""
+    url = url.strip()
+    u = urlparse(url)
+    out = [("enlace + download=1", url_descarga(url))]
+    m = re.match(r"^/:\w:/[a-z]/((?:personal|sites|teams)/[^/]+)/([^/?]+)", u.path)
+    if m:
+        out.append(("download.aspx?share=", f"{u.scheme}://{u.netloc}/{m.group(1)}/_layouts/15/download.aspx?share={m.group(2)}"))
+    cod = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+    out.append(("API de shares", f"{u.scheme}://{u.netloc}/_api/v2.0/shares/u!{cod}/driveitem/content"))
+    return out
+
+
+def _abrir(opener, url: str):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*", "Accept-Language": "es-CO,es;q=0.9"})
+    try:
+        with opener.open(req, timeout=40) as r:
+            return r.status, r.geturl(), r.headers.get("Content-Type", ""), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, url, e.headers.get("Content-Type", ""), e.read()
+
+
+@st.cache_data(ttl=MINUTOS_CACHE * 60, show_spinner="Descargando el Excel desde SharePoint…")
+def descargar_excel(url: str):
+    """Prueba varias formas de descarga (con cookies, como un navegador) hasta obtener un archivo Excel."""
+    diag = []
+    for nombre, cand in candidatos_descarga(url):
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        try:
+            if nombre != "API de shares":      # visita previa: SharePoint entrega cookies de invitado
+                try:
+                    _abrir(opener, url.strip())
+                except Exception:
+                    pass
+            estado, final, tipo, datos = _abrir(opener, cand)
+        except Exception as e:
+            diag.append(f"• {nombre}: error de conexión ({e})")
+            continue
+        if datos.startswith(b"PK"):            # .xlsx/.xlsm son ZIP; HTML = pidió inicio de sesión o error
+            return datos, datetime.now(), nombre
+        f = urlparse(final)
+        diag.append(f"• {nombre}: HTTP {estado}, tipo «{tipo or 'desconocido'}», terminó en {f.netloc}{f.path[:70]}")
+    raise ValueError("\n".join(diag))
+
+
+def leer_local(ruta: str):
+    """Lee el archivo sincronizado. Devuelve (bytes, fecha_modificación) o (None, motivo)."""
+    p = Path(ruta)
+    if not p.exists():
+        return None, "no_existe"
+    for _ in range(4):  # Excel/OneDrive pueden bloquearlo unos segundos mientras guardan
+        try:
+            return p.read_bytes(), datetime.fromtimestamp(p.stat().st_mtime)
+        except OSError:
+            time.sleep(0.7)
+    return None, "bloqueado"
 
 
 def quitar_fase(c: str) -> str:
@@ -428,23 +525,100 @@ def resumen_profesor(d: pd.DataFrame, por="Profesor") -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------
+# Acceso con contraseña (antes de leer cualquier dato)
+# ----------------------------------------------------------------------------
+# Recomendado: definir la clave en .streamlit/secrets.toml  ->  password = "su_clave"
+# (o en la variable de entorno DASHBOARD_PASSWORD). Si no existe, se usa esta huella SHA-256,
+# que no revela la contraseña en el código.
+HASH_CLAVE = "a427ec27fe146a0770e0646f4f4c689ea95b8a34b6a623eb1f3e2d714ea4e2c3"
+
+
+def verificar_clave(clave: str) -> bool:
+    try:
+        secreto = st.secrets.get("password")
+    except Exception:
+        secreto = None
+    secreto = secreto or os.environ.get("DASHBOARD_PASSWORD")
+    if secreto:
+        return hmac.compare_digest(clave.encode(), str(secreto).encode())
+    return hmac.compare_digest(hashlib.sha256(clave.encode()).hexdigest(), HASH_CLAVE)
+
+
+def pedir_clave():
+    if st.session_state.get("autenticado"):
+        return
+    st.markdown('<div class="hero"><h1>🔒 Seguimiento académico UCC</h1>'
+                '<p>Acceso restringido. Ingrese la contraseña para continuar.</p></div>', unsafe_allow_html=True)
+    _, centro, _ = st.columns([1, 1.4, 1])
+    with centro:
+        with st.form("login"):
+            clave = st.text_input("Contraseña", type="password")
+            entrar = st.form_submit_button("Ingresar")
+        if entrar:
+            if verificar_clave(clave):
+                st.session_state["autenticado"] = True
+                st.rerun()
+            time.sleep(1)  # frena intentos repetidos
+            st.error("Contraseña incorrecta.")
+    st.stop()
+
+
+pedir_clave()
+
+# ----------------------------------------------------------------------------
 # Bienvenida y carga del archivo
 # ----------------------------------------------------------------------------
 st.markdown('<div class="hero"><h1>🎓 Bienvenido al dashboard de seguimiento académico de la UCC</h1>'
             '<p>Siga los tres pasos para ver el informe: modalidad, ciclo y programa.</p></div>',
             unsafe_allow_html=True)
 
+ruta_excel = os.environ.get("DASHBOARD_EXCEL_RUTA", RUTA_EXCEL)
 with st.sidebar:
-    st.header("📂 Archivo")
-    archivo = st.file_uploader("Sube el Excel de seguimiento", type=["xlsx", "xlsm"])
+    st.header("📂 Datos")
+    if st.button("🔄 Actualizar datos", help="Vuelve a descargar el Excel ahora. Si no, se actualiza solo "
+                                             f"cada {MINUTOS_CACHE} minutos."):
+        st.cache_data.clear()
+    with st.expander("Usar otro archivo (opcional)"):
+        archivo = st.file_uploader("Sube un Excel de seguimiento", type=["xlsx", "xlsm"])
 
+contenido, origen, avisos_fuente, detalle = None, "", [], ""
 if archivo is not None:
-    contenido = archivo.getvalue()
-elif Path(ARCHIVO_POR_DEFECTO).exists():
-    contenido = Path(ARCHIVO_POR_DEFECTO).read_bytes()
+    contenido, origen = archivo.getvalue(), f"Archivo subido: {archivo.name}"
 else:
-    st.info("👈 Primero suba el archivo Excel de seguimiento desde la barra lateral.")
+    enlace = obtener_enlace()
+    if enlace:
+        try:
+            contenido, t, via = descargar_excel(enlace)
+            origen = f"SharePoint · descargado {t:%d/%m/%Y %H:%M}"
+        except Exception as e:
+            avisos_fuente.append("No se pudo descargar el Excel desde SharePoint.")
+            detalle = str(e)
+    if contenido is None:
+        contenido, info = leer_local(ruta_excel)
+        if contenido is not None:
+            origen = f"Excel sincronizado (copia local) · modificado {info:%d/%m/%Y %H:%M}"
+        elif info == "bloqueado":
+            avisos_fuente.append("El Excel local está en uso o sincronizándose.")
+        elif Path(ARCHIVO_POR_DEFECTO).exists():
+            contenido, origen = Path(ARCHIVO_POR_DEFECTO).read_bytes(), f"Archivo local: {ARCHIVO_POR_DEFECTO}"
+if contenido is None:
+    for a in avisos_fuente:
+        st.error(a)
+    st.info("No fue posible obtener el Excel. Pulse «🔄 Actualizar datos» en unos segundos o suba el archivo "
+            "manualmente desde la barra lateral («Usar otro archivo»).")
+if avisos_fuente and (contenido is None or detalle):
+    if contenido is not None:
+        st.warning(avisos_fuente[0] + " Se está usando la copia local; los datos podrían no estar al día.")
+    if detalle:
+        with st.expander("🔍 Ver detalle técnico de la descarga"):
+            st.code(detalle)
+if contenido is None:
     st.stop()
+with st.sidebar:
+    st.caption(f"✅ {origen}")
+    if st.button("🔒 Cerrar sesión"):
+        st.session_state.clear()
+        st.rerun()
 
 try:
     base, meta = cargar_datos(contenido)
